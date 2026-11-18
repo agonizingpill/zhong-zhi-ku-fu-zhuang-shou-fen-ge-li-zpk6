@@ -1,10 +1,25 @@
-from sqlalchemy import select,func
+from sqlalchemy import select,func,inspect,text
 from .db import Base,engine,Session
 from .models import *
 from .auth import hashed
 
+# 仅新增可空/带默认的列，不回填或覆盖历史业务记录；已有演示库无需重建。
+ADDITIVE_COLUMNS={
+    'germination_tests':{'attempt':'INTEGER DEFAULT 0'},
+    'regenerations':{'issue_snapshot':'JSON NULL'},
+}
+
+def ensure_columns():
+    inspector=inspect(engine)
+    with engine.begin() as conn:
+        for table,columns in ADDITIVE_COLUMNS.items():
+            if not inspector.has_table(table):continue
+            existing={c['name'] for c in inspector.get_columns(table)}
+            for name,ddl in columns.items():
+                if name not in existing:conn.execute(text(f'ALTER TABLE {table} ADD COLUMN {name} {ddl}'))
+
 def seed():
-    Base.metadata.create_all(engine)
+    Base.metadata.create_all(engine);ensure_columns()
     with Session() as s:
         for role in ('operator','supervisor','viewer'):
             email=role+'@qinghe.demo'

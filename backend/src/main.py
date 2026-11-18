@@ -10,6 +10,7 @@ from .models import *
 from .schemas import *
 from .auth import current,writer,supervisor,verify,token
 from .common import pack,lock,add,audit
+from .vitality import needs_recompute,REQUIRED_PROBABILITY
 from . import renewal_service as renewal,isolation_service as isolation,harvest_service as harvest,sharing_service as sharing
 from .middleware import Trace,Burst
 queue=redis.Redis.from_url(os.environ['REDIS_URL'],decode_responses=True)
@@ -31,7 +32,23 @@ def login(d:Login,s=Depends(session)):
 def me(u=Depends(current)):return {'email':u.email,'role':u.role}
 @app.get('/archive')
 def archive(s=Depends(session),u=Depends(current)):
-    return {cls.__tablename__:[pack(x)for x in s.scalars(select(cls).order_by(cls.id))]for cls in (Accession,Lot,GerminationTest,Regeneration,Plot,Flowering,Pollination,Harvest,Distribution)}
+    rows={cls.__tablename__:[pack(x)for x in s.scalars(select(cls).order_by(cls.id))]for cls in (Accession,Lot,GerminationTest,Regeneration,Plot,Flowering,Pollination,Harvest,Distribution)}
+    # 只读派生标记：估计是否仍对应当前同批样本集；不写入数据库，不回填历史记录。
+    for lot in rows['lots']:
+        tests=[t for t in rows['germination_tests'] if t['lot_id']==lot['id']]
+        for t in tests:
+            t['estimate_stale']=bool(t['prediction']) and needs_recompute(t['prediction'],tests)
+        current=[t for t in tests if t['state']=='ready' and t['prediction'] and not t['estimate_stale']]
+        latest=max(current,key=lambda t:t['id'],default=None)
+        lot['current_estimate_test_id']=latest['id'] if latest else None
+        lot['current_probability_below_85']=latest['prediction']['probability_below_85'] if latest else None
+    # 待领种单的当前门槛：补测改判后即使原申请仍存在，也不再显示为可领种。
+    for r in rows['regenerations']:
+        lot=next((l for l in rows['lots'] if l['id']==r['lot_id']),None)
+        probability=(lot or {}).get('current_probability_below_85')
+        r['current_probability_below_85']=probability
+        r['issue_allowed']=probability is not None and probability>=REQUIRED_PROBABILITY
+    return rows
 @app.get('/audits')
 def audits(s=Depends(session),u=Depends(current)):return [pack(x)for x in s.scalars(select(Audit).order_by(Audit.id.desc()).limit(50))]
 @app.post('/accessions')
@@ -52,10 +69,17 @@ def test(d:TestInput,s=Depends(session),u=Depends(writer)):
     x=renewal.create_test(s,d,u);s.commit();return x
 @app.post('/germination-tests/{id}/estimate')
 def estimate(id:int,s=Depends(session),u=Depends(writer)):
+    pre=s.get(GerminationTest,id)
+    if not pre:raise HTTPException(404,'复测记录不存在')
+    lot=s.get(Lot,pre.lot_id);lock(s,Accession,lot.accession_id)
     x=lock(s,GerminationTest,id)
-    if x.state not in ('recorded','failed'):raise HTTPException(409,'仅新复测或失败评估可入队')
-    x.state='queued';x.error=None;s.commit()
-    try:queue.rpush('seed-vitality',id)
+    tests=list(s.scalars(select(GerminationTest).where(GerminationTest.lot_id==lot.id)))
+    recompute=x.state in ('stale',) or (x.state=='ready' and x.prediction and needs_recompute(x.prediction,tests))
+    if x.state not in ('recorded','failed') and not recompute:raise HTTPException(409,'仅新复测、失效估计或失败评估可入队重算')
+    x.state='queued';x.error=None;x.attempt=(x.attempt or 0)+1
+    # 重算在同一复测行上推进尝试号：旧尝试号的乱序消息会被worker丢弃，不会重复计入样本。
+    audit(s,u,'送交活力重算 '+x.code);s.commit()
+    try:queue.rpush('seed-vitality',f'{id}:{x.attempt}')
     except Exception:x.state='failed';x.error='队列不可用，请恢复后重试';s.commit();raise HTTPException(503,x.error)
     return pack(x)
 @app.post('/regenerations')
